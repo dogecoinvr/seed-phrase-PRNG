@@ -1,0 +1,523 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <mbedtls/sha256.h> // For SHA-256 hashing
+
+#define OLED_RESET     -1
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define SD_CS_PIN      5    // Chip Select pin for SD card
+
+// Define key pins (Please set these according to your hardware)
+const int keyUpPin = 14;       // K1 Up
+const int keyDownPin = 27;     // K2 Down
+const int keyConfirmPin = 26;  // K3 #
+const int keyDeletePin = 25;   // K4 *
+
+// Key definitions
+#define KEY_NONE           0
+#define KEY_UP             1
+#define KEY_DOWN           2
+#define KEY_CONFIRM_SHORT  3
+#define KEY_CONFIRM_LONG   4
+#define KEY_DELETE         5
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Function prototypes
+void setup();
+void loop();
+void mainMenu();
+void generateSeedPhrase();
+int getKeyPress();
+void displayText(String text);
+String readBase6Digits(int numDigits);
+String sha256(uint8_t* data, size_t length);
+String getWordFromIndex(int index);
+
+const char* bip39FilePath = "/bip39.txt";
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize key pins
+  pinMode(keyUpPin, INPUT_PULLUP);
+  pinMode(keyDownPin, INPUT_PULLUP);
+  pinMode(keyConfirmPin, INPUT_PULLUP);
+  pinMode(keyDeletePin, INPUT_PULLUP);
+
+  // Initialize display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1);
+  }
+  display.clearDisplay();
+  display.display();
+  displayText("Initializing...");
+  delay(1000);
+
+  // Initialize SD card
+  if (!SD.begin(SD_CS_PIN)) {
+    displayText("SD Card Mount Failed");
+    while (1);
+  }
+
+  // Check if bip39.txt exists
+  if (!SD.exists(bip39FilePath)) {
+    displayText("bip39.txt not found");
+    while (1);
+  }
+
+  mainMenu();
+}
+
+void loop() {
+  // Empty loop since mainMenu() runs indefinitely
+}
+
+void mainMenu() {
+  const char* menuOptions[] = {
+    "1.Generate Seed Phrase",
+    "2.Exit"
+  };
+  int numMenuOptions = 2;
+  int currentOption = 0;
+
+  while (true) {
+    displayText(String(menuOptions[currentOption]) + "\n\nDeveloped by DogecoinVR on X and ChatGPT o1 preview");
+
+    // Wait for key press
+    int key = getKeyPress();
+
+    if (key == KEY_UP) {
+      currentOption--;
+      if (currentOption < 0) currentOption = numMenuOptions - 1;
+    } else if (key == KEY_DOWN) {
+      currentOption++;
+      if (currentOption >= numMenuOptions) currentOption = 0;
+    } else if (key == KEY_CONFIRM_SHORT) {
+      if (currentOption == 0) {
+        generateSeedPhrase();
+      } else if (currentOption == 1) {
+        displayText("Exiting...");
+        delay(1000);
+        ESP.restart(); // Restart the device
+      }
+    }
+  }
+}
+
+void generateSeedPhrase() {
+  // Ask the user to choose between 12 or 24 words
+  int numWords = 12;
+  const char* options[] = {
+    "1. 12 words",
+    "2. 24 words"
+  };
+  int numOptions = 2;
+  int currentOption = 0;
+
+  while (true) {
+    displayText(options[currentOption]);
+
+    int key = getKeyPress();
+    if (key == KEY_UP) {
+      currentOption--;
+      if (currentOption < 0) currentOption = numOptions - 1;
+    } else if (key == KEY_DOWN) {
+      currentOption++;
+      if (currentOption >= numOptions) currentOption = 0;
+    } else if (key == KEY_CONFIRM_SHORT) {
+      if (currentOption == 0) {
+        numWords = 12;
+      } else if (currentOption == 1) {
+        numWords = 24;
+      }
+      break;
+    }
+  }
+
+  int numDigits = (numWords == 12) ? 50 : 100;
+
+  // Read base-6 digits from the user
+  String base6Digits = readBase6Digits(numDigits);
+
+  // Confirm the input
+  displayText("Confirm input?\n1.Yes 2.No");
+  int confirmOption = 0;
+  while (true) {
+    int key = getKeyPress();
+    if (key == KEY_UP || key == KEY_DOWN) {
+      confirmOption = 1 - confirmOption; // Toggle between 0 and 1
+    } else if (key == KEY_CONFIRM_SHORT) {
+      break;
+    }
+    displayText((confirmOption == 0) ? "1.Yes\n2.No" : "1.No\n2.Yes");
+  }
+  if (confirmOption == 1) {
+    // User chose "No"
+    return;
+  }
+
+  // Convert base-6 digits to bits
+  String bits = "";
+
+  for (int i = 0; i < base6Digits.length(); i++) {
+    char c = base6Digits.charAt(i);
+    int digit = c - '1'; // Adjusted from '0' to '1'
+    if (digit < 0 || digit > 5) {
+      displayText("Invalid digit: " + String(c));
+      delay(2000);
+      return;
+    }
+    // Convert digit to 3-bit binary string
+    String digitBits = "";
+    for (int j = 2; j >= 0; j--) {
+      digitBits += ((digit >> j) & 1) ? '1' : '0';
+    }
+    bits += digitBits;
+  }
+
+  // Truncate or pad bits to the required entropy length
+  int entropyBitsLength = (numWords == 12) ? 128 : 256;
+  if (bits.length() > entropyBitsLength) {
+    bits = bits.substring(0, entropyBitsLength);
+  } else {
+    while (bits.length() < entropyBitsLength) {
+      bits += '0'; // Pad with zeros if not enough bits
+    }
+  }
+
+  // Convert bits to entropy bytes
+  int entropyBytesLength = entropyBitsLength / 8;
+  uint8_t entropy[32]; // Max 32 bytes for 256 bits
+  memset(entropy, 0, sizeof(entropy));
+
+  for (int i = 0; i < entropyBytesLength; i++) {
+    uint8_t byte = 0;
+    for (int j = 0; j < 8; j++) {
+      int bitIndex = i * 8 + j;
+      if (bits.charAt(bitIndex) == '1') {
+        byte |= (1 << (7 - j));
+      }
+    }
+    entropy[i] = byte;
+  }
+
+  // Compute the checksum
+  int checksumLength = entropyBitsLength / 32;
+
+  // Compute SHA256 hash of entropy
+  uint8_t hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, entropy, entropyBytesLength);
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  // Extract the first checksumLength bits from the hash
+  String checksumBits = "";
+  for (int i = 0; i < checksumLength; i++) {
+    int byteIndex = i / 8;
+    int bitIndex = i % 8;
+    int bit = (hash[byteIndex] >> (7 - bitIndex)) & 1;
+    checksumBits += (bit ? '1' : '0');
+  }
+
+  // Append checksum bits to the entropy bits
+  bits += checksumBits;
+
+  // Split bits into 11-bit segments
+  int totalBitsLength = entropyBitsLength + checksumLength;
+  int numWordsRequired = totalBitsLength / 11;
+
+  if (numWordsRequired != numWords) {
+    displayText("Error in bits length");
+    delay(2000);
+    return;
+  }
+
+  String words[24]; // Max 24 words
+  int wordIndices[24]; // Store word indices
+
+  for (int i = 0; i < numWords; i++) {
+    int index = 0;
+    for (int j = 0; j < 11; j++) {
+      int bitIndex = i * 11 + j;
+      if (bits.charAt(bitIndex) == '1') {
+        index |= (1 << (10 - j));
+      }
+    }
+    wordIndices[i] = index;
+    // Map index to wordlist
+    words[i] = getWordFromIndex(index);
+    if (words[i] == "") {
+      displayText("Error fetching word");
+      delay(2000);
+      return;
+    }
+  }
+
+  // Display the words with their binary formats
+  int currentWordIndex = 0;
+
+  while (true) {
+    // Check if currentWordIndex is within bounds
+    if (currentWordIndex < 0) currentWordIndex = numWords - 1;
+    if (currentWordIndex >= numWords) currentWordIndex = 0;
+
+    // Get the current word and its index
+    String word = words[currentWordIndex];
+    int index = wordIndices[currentWordIndex];
+
+    // Convert index to 11-bit binary string
+    String binaryStr = "";
+    for (int i = 10; i >= 0; i--) {
+      binaryStr += ((index >> i) & 1) ? '1' : '0';
+    }
+
+    // Prepare display string
+    String displayStr = String(currentWordIndex + 1) + ". " + word + "\nBin: " + binaryStr;
+
+    displayText(displayStr);
+
+    // Wait for key press
+    int key = getKeyPress();
+    if (key == KEY_UP) {
+      currentWordIndex--;
+    } else if (key == KEY_DOWN) {
+      currentWordIndex++;
+    } else if (key == KEY_CONFIRM_SHORT) {
+      // Exit viewing
+      break;
+    }
+  }
+
+  // End of seed phrase generation
+  displayText("Seed phrase generated\n\nDeveloped by DogecoinVR on X and ChatGPT o1 preview");
+  delay(2000);
+}
+
+String readBase6Digits(int numDigits) {
+  String input = "";
+  int currentDigit = -1; // Start with no digit displayed
+  bool confirmWasPressed = false;
+  unsigned long confirmPressStartTime = 0;
+
+  while (input.length() < numDigits) {
+    // Display the prompt and input
+    String displayStr = "Enter base-6 digits\n(" + String(input.length() + 1) + "/" + String(numDigits) + "):\n";
+    displayStr += input;
+    if (currentDigit >= 0) {
+      displayStr += String(currentDigit + 1); // Display digits 1-6
+    }
+    displayText(displayStr);
+
+    // Read key states
+    bool upPressed = digitalRead(keyUpPin) == LOW;
+    bool downPressed = digitalRead(keyDownPin) == LOW;
+    bool confirmPressed = digitalRead(keyConfirmPin) == LOW;
+    bool deletePressed = digitalRead(keyDeletePin) == LOW;
+
+    if (upPressed) {
+      if (currentDigit == -1) {
+        currentDigit = 0; // Initialize to 0 (will display as 1)
+      } else {
+        currentDigit++;
+        if (currentDigit > 5) currentDigit = 0;
+      }
+      delay(200); // Debounce
+    } else if (downPressed) {
+      if (currentDigit == -1) {
+        currentDigit = 5; // Initialize to 5 (will display as 6)
+      } else {
+        currentDigit--;
+        if (currentDigit < 0) currentDigit = 5;
+      }
+      delay(200);
+    } else if (deletePressed) {
+      if (currentDigit != -1) {
+        currentDigit = -1; // Clear current digit
+      } else if (input.length() > 0) {
+        input.remove(input.length() - 1);
+      }
+      delay(200);
+    } else if (confirmPressed) {
+      if (!confirmWasPressed) {
+        confirmWasPressed = true;
+        confirmPressStartTime = millis();
+      } else {
+        // Check for long press
+        if (millis() - confirmPressStartTime > 1000) {
+          // Long press detected
+          if (input.length() > 0) {
+            return input;
+          }
+          confirmWasPressed = false;
+          delay(200);
+        }
+      }
+    } else {
+      if (confirmWasPressed) {
+        // Key was released before long press threshold
+        // So it's a short press
+        if (currentDigit >= 0) {
+          input += String(currentDigit + 1); // Store digit as 1-6
+          currentDigit = -1; // Reset current digit
+        }
+        confirmWasPressed = false;
+        delay(200);
+      }
+    }
+
+    delay(50);
+  }
+
+  return input;
+}
+
+void displayText(String text) {
+  display.clearDisplay();
+  display.setTextSize(1); // Smallest text size
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.setTextWrap(false); // We'll handle wrapping manually
+
+  int16_t cursor_x = 0;
+  int16_t cursor_y = 0;
+  int16_t x1, y1;
+  uint16_t w, h;
+  String line = "";
+  char c;
+
+  for (uint16_t i = 0; i < text.length(); i++) {
+    c = text.charAt(i);
+
+    if (c == '\n') {
+      // Print the current line and move to the next
+      display.setCursor(cursor_x, cursor_y);
+      display.print(line);
+      line = "";
+      cursor_y += 8; // Move down by one line (adjust if needed)
+      cursor_x = 0;
+    } else {
+      // Add character to line and measure
+      String testLine = line + c;
+      display.getTextBounds(testLine, cursor_x, cursor_y, &x1, &y1, &w, &h);
+
+      if (w > SCREEN_WIDTH) {
+        // Line is too long, print current line
+        display.setCursor(cursor_x, cursor_y);
+        display.print(line);
+        line = String(c); // Start new line with current character
+        cursor_y += 8; // Move down by one line
+        cursor_x = 0;
+
+        // Check if we've exceeded the screen height
+        if (cursor_y + 8 > SCREEN_HEIGHT) {
+          break; // No more space to display text
+        }
+      } else {
+        line = testLine;
+      }
+    }
+  }
+
+  // Print any remaining text in 'line'
+  if (line.length() > 0 && cursor_y + 8 <= SCREEN_HEIGHT) {
+    display.setCursor(cursor_x, cursor_y);
+    display.print(line);
+  }
+
+  display.display();
+}
+
+int getKeyPress() {
+  static unsigned long confirmPressStartTime = 0;
+  static bool confirmWasPressed = false;
+
+  bool upPressed = digitalRead(keyUpPin) == LOW;
+  bool downPressed = digitalRead(keyDownPin) == LOW;
+  bool confirmPressed = digitalRead(keyConfirmPin) == LOW;
+  bool deletePressed = digitalRead(keyDeletePin) == LOW;
+
+  if (upPressed) {
+    delay(200); // Debounce
+    return KEY_UP;
+  } else if (downPressed) {
+    delay(200);
+    return KEY_DOWN;
+  } else if (deletePressed) {
+    delay(200);
+    return KEY_DELETE;
+  } else if (confirmPressed) {
+    if (!confirmWasPressed) {
+      confirmWasPressed = true;
+      confirmPressStartTime = millis();
+    } else {
+      if (millis() - confirmPressStartTime > 1000) {
+        // Long press detected
+        confirmWasPressed = false;
+        delay(200);
+        return KEY_CONFIRM_LONG;
+      }
+    }
+  } else {
+    if (confirmWasPressed) {
+      confirmWasPressed = false;
+      delay(200);
+      return KEY_CONFIRM_SHORT;
+    }
+  }
+
+  return KEY_NONE;
+}
+
+String sha256(uint8_t* data, size_t length) {
+  uint8_t shaResult[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, data, length);
+  mbedtls_sha256_finish(&ctx, shaResult);
+  mbedtls_sha256_free(&ctx);
+
+  String hashStr = "";
+  for (int i = 0; i < 32; i++) {
+    if (shaResult[i] < 16) hashStr += '0';
+    hashStr += String(shaResult[i], HEX);
+  }
+  hashStr.toLowerCase(); // Ensure lowercase
+  return hashStr;
+}
+
+String getWordFromIndex(int index) {
+  if (index < 0 || index >= 2048) {
+    return "";
+  }
+
+  File file = SD.open(bip39FilePath, FILE_READ);
+  if (!file) {
+    displayText("Failed to open\nbip39.txt");
+    return "";
+  }
+
+  String word = "";
+  int currentLine = 0;
+  while (file.available()) {
+    word = file.readStringUntil('\n');
+    // Remove any carriage return characters
+    word.trim();
+
+    if (currentLine == index) {
+      file.close();
+      return word;
+    }
+    currentLine++;
+  }
+  file.close();
+  return "";
+}
